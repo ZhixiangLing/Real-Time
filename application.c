@@ -67,7 +67,7 @@
 #define MUSICIAN_MODE  1
 
 //------------------- 键盘输入缓存相关 -------------------//
-#define CACHE_SIZE 10000
+#define CACHE_SIZE 100
 char inputCache[CACHE_SIZE];
 int cacheIndex = 0;
 // 模拟CAN连接状态，全局变量：1表示连接，0表示断开
@@ -370,7 +370,6 @@ void process_CAN_message(App *self, char *buffer) {
     if (strcmp(buffer, "reconnect") == 0) {
         canConnected = 1;
         SCI_WRITE(&sci0, "CAN reconnected.\n");
-        // 当收到重连消息时，刷新并打印整个输入缓存
         flushInputCache();
         return;
     }
@@ -461,46 +460,33 @@ void reader(App *self, int c) {
     if (self->mode == CONDUCTOR_MODE) {
         switch (c) {
             case 'e': {
-    SCI_WRITE(&sci0, "Rcv: 'e'\n");
-    self->buffer[self->buf_index] = '\0';
-    int num = atoi(self->buffer);
-    self->buf_index = 0;
-    if (num >= -5 && num <= 5) {
-        if (isCANConnected()) {
-            // CAN连接正常时，直接处理更新
-            self->current_key = num;
-            musicPlayer.key = num;
-            //get_period_key(self, num);
-            char can_cmd[8];
-            snprintf(can_cmd, sizeof(can_cmd), "K%d", num);
-            send_CAN_command(can_cmd);
-            // 不调用 flushInputCache()，以便断线期间的缓存不会被清空
-        } else {
-            // CAN断开时，将输入追加到缓存中
-            char temp[10];
-            snprintf(temp, sizeof(temp), "%d ", num);
-            strncat(inputCache, temp, CACHE_SIZE - strlen(inputCache) - 1);
-        }
-    }
-    else if (num >= 60 && num <= 240) {
-        if (isCANConnected()) {
-            self->tempo = num;
-            musicPlayer.tempo = num;
-            char can_cmd[8];
-            snprintf(can_cmd, sizeof(can_cmd), "T%d", num);
-            send_CAN_command(can_cmd);
-            SCI_WRITE(&sci0, "Tempo updated\n");
-        } else {
-            char temp[10];
-            snprintf(temp, sizeof(temp), "%d ", num);
-            strncat(inputCache, temp, CACHE_SIZE - strlen(inputCache) - 1);
-        }
-    }
-    else {
-        SCI_WRITE(&sci0, "Invalid input.\n");
-    }
-    break;
-}
+                SCI_WRITE(&sci0, "Rcv: 'e'\n");
+                self->buffer[self->buf_index] = '\0';
+                int num = atoi(self->buffer);
+                self->buf_index = 0;
+                // 若输入为 -5~5 则视为调号更新，否则若在60~240范围内视为tempo更新（BPM）
+                if (num >= -5 && num <= 5) {
+                    self->current_key = num;
+                    musicPlayer.key = num;
+                    //get_period_key(self, num);
+                    char can_cmd[8];
+                  snprintf(can_cmd, sizeof(can_cmd), "K%d", num);
+                    send_CAN_command(can_cmd);
+                    flushInputCache();
+                }
+                else if (num >= 60 && num <= 240) {
+                    self->tempo = num;
+                    musicPlayer.tempo = num;
+                    char can_cmd[8];
+                    snprintf(can_cmd, sizeof(can_cmd), "T%d", num);
+                    send_CAN_command(can_cmd);
+                    SCI_WRITE(&sci0, "Tempo updated\n");
+                }
+                else {
+                    SCI_WRITE(&sci0, "Invalid input.\n");
+                }
+                break;
+            }
 
             case 'u':
                 ASYNC(&toneGen, increase_volume, 0);
@@ -522,13 +508,15 @@ void reader(App *self, int c) {
                 break;
             case 'p':
                 SCI_WRITE(&sci0, "Starting melody playback...\n");
-                if (!self->playback_active) {
-                    self->playback_active = 1;
-                    toneGen.playing = 1;
-                    ASYNC(&musicPlayer, start_playback, 0);
-                    send_CAN_command("play");
-                }
-                break;
+    if (!self->playback_active) {
+        self->playback_active = 1;
+        toneGen.playing = 1;
+        ASYNC(&musicPlayer, start_playback, 0);
+        send_CAN_command("play");
+    } else {
+        SCI_WRITE(&sci0, "Already playing. Duplicate play command ignored.\n");
+    }
+    break;
             case 'q':
                 SCI_WRITE(&sci0, "Stopping melody playback...\n");
                 toneGen.playing = 0;
@@ -592,9 +580,14 @@ void reader(App *self, int c) {
                 break;
 
             case 'p':
-                SCI_WRITE(&sci0, "Musician Mode: Play command\n");
-                send_CAN_command("play");
-                break;
+               SCI_WRITE(&sci0, "Musician Mode: Play command\n");
+    // 添加检查：如果已经在播放，则不再发送新的play命令
+    if (!app.playback_active) {
+        send_CAN_command("play");
+    } else {
+        SCI_WRITE(&sci0, "Already playing. Duplicate play command ignored.\n");
+    }
+    break;
             case 'q':
                 SCI_WRITE(&sci0, "Musician Mode: Stop command\n");
                 send_CAN_command("stop");
