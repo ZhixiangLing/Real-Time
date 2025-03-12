@@ -35,9 +35,11 @@
  *      其中，a 表示1拍、b表示2拍、c表示1/2拍。
  *    - 播放时根据节拍长度与音符时值计算音符的持续时间，然后安排发音和停止的时机。
  *
- * 9. 指挥家模式下的键盘输入缓存：
- *    - 当CAN断开时（模拟接收到"disconnect"命令），键盘输入将被缓存；
- *      当CAN重新连接（接收到"reconnect"命令）时，缓存中的内容会打印出来。
+ * 9. 指挥家模式下键盘输入缓存：
+ *    - 当CAN断开（模拟接收到"disconnect"消息）时，指挥家模式下通过键盘输入的值将被缓存；
+ *      当CAN重新连接（接收到"reconnect"消息）时，缓存内容将一次性打印出来。
+ *
+ * 10. 无论运行在哪种模式下，CAN接收函数都会打印出所有接收到的消息。
  */
 
 #include "TinyTimber.h"
@@ -51,43 +53,30 @@
 #include "system_stm32f4xx.h"
 #include "core_cm4.h"
 
+// 宏定义
 #define min_index -10
 #define max_index 14
 #define period_size (max_index - min_index + 1)
 #define DAC_Address (*(volatile uint8_t*) 0x4000741C)
-#define NUM_RUN 500
-#define CPU_FREQ_HZ 168000000
 #define GAP_DURATION 50
 #define MELODY_LENGTH 32
-// 默认节奏为120 bpm，即1拍为500ms，但这里存储的tempo在音乐播放中将作为BPM使用
+// 默认节奏为120 bpm，即每拍500ms（BPM用于计算拍长）
 #define DEFAULT_TEMPO 120
 
 #define CONDUCTOR_MODE 0
 #define MUSICIAN_MODE  1
 
-//----- 为指挥家模式添加键盘输入缓存 -----//
-#define CACHE_SIZE 100
+//------------------- 键盘输入缓存相关 -------------------//
+#define CACHE_SIZE 10000
 char inputCache[CACHE_SIZE];
 int cacheIndex = 0;
-// 模拟CAN连接状态，全局变量，1表示连接，0表示断开
+// 模拟CAN连接状态，全局变量：1表示连接，0表示断开
 int canConnected = 1;
 
-int isCANConnected(void) {
-    return canConnected;
-}
 
-void flushInputCache(void) {
-    if (cacheIndex > 0) {
-        SCI_WRITE(&sci0, "Cached Inputs:\n");
-        inputCache[cacheIndex] = '\0';
-        SCI_WRITE(&sci0, inputCache);
-        SCI_WRITE(&sci0, "\n");
-        cacheIndex = 0;
-    }
-}
-//----- 缓存相关结束 -----//
+//------------------- 缓存相关结束 -------------------//
 
-// 扩展后的App结构体（保留原有功能，同时扩展调号、节奏、播放状态和模式）
+// 数据结构定义
 typedef struct {
     Object super;
     int history[3];
@@ -97,9 +86,9 @@ typedef struct {
     int freq_index[32];
     int period[period_size];
     int current_key;       // 当前调号
-    int tempo;             // 节奏，单位为 bpm（后续转换为beat时长）
+    int tempo;             // 节奏，单位为 BPM
     int playback_active;   // 0：停止播放，1：播放中
-    int mode;              // 0：Conductor（指挥家）模式，1：Musician（演奏家）模式
+    int mode;              // 0：Conductor模式，1：Musician模式
 } App;
 
 typedef struct {
@@ -120,10 +109,10 @@ typedef struct {
 typedef struct {
     Object super;
     int current_note;
-    int tempo;       // 这里存储的是BPM，与App.tempo保持一致
+    int tempo;       // 存储BPM，与App.tempo保持一致
     int key;
     int melody[32];
-    // note_pattern定义了音符时值：a=1拍、b=2拍、c=0.5拍，循环使用
+    // note_pattern定义音符时值：a=1拍，b=2拍，c=0.5拍，循环使用
     float note_pattern[32];
 } MusicPlayer;
 
@@ -132,20 +121,35 @@ App app = { initObject(), {0,0,0}, 0, "", 0, {0}, {0}, 0, DEFAULT_TEMPO, 0, COND
 ToneGenerator toneGen = { initObject(), 15, 0, 0, 0, 0 };
 BackgroundTask bgTask = { initObject(), 1000, 1 };
 MusicPlayer musicPlayer = { initObject(), 0, DEFAULT_TEMPO, 0,
-    // Brother John旋律音调（基于原有定义）
+    // Brother John旋律音调（原有定义）
     {0,2,4,0,0,2,4,0,4,5,7,4,5,7,7,9,7,5,4,0,7,9,7,5,4,0,0,-5,0,0,-5,0},
     // 对应的时值模式：a=1拍, b=2拍, c=0.5拍
     {1,1,1,1,1,1,1,1,1,1,2,1,1,2,0.5,0.5,0.5,0.5,1,1,0.5,0.5,0.5,0.5,1,1,1,1,2,1,1,2}
 };
 
+// 函数前置声明
 void reader(App *self, int c);
 void receiver(App *self, int unused);
 void next_note(MusicPlayer *self, int unused);
 
-// 定义SCI和CAN全局对象（必须放在所有使用它们之前）
+// 定义SCI和CAN全局对象（必须在所有使用它们之前）
 Serial sci0 = initSerial(SCI_PORT0, &app, reader);
 Can can0 = initCan(CAN_PORT0, &app, receiver);
 
+
+int isCANConnected(void) {
+    return canConnected;
+}
+
+void flushInputCache(void) {
+    if (cacheIndex > 0) {
+        SCI_WRITE(&sci0, "Cached Inputs:\n");
+        inputCache[cacheIndex] = '\0';
+        SCI_WRITE(&sci0, inputCache);
+        SCI_WRITE(&sci0, "\n");
+        cacheIndex = 0;
+    }
+}
 /////////////////////////////////////////////////////////////////////////////
 // DWT初始化（用于精确计时）
 void init_dwt(void) {
@@ -180,7 +184,7 @@ void init_period(App *self) {
 }
 
 int get_period_index(App *self, int k) {
-    if(k < min_index || k > max_index)
+    if (k < min_index || k > max_index)
         return -1;
     else
         return k - min_index;
@@ -236,9 +240,9 @@ void generate_tone(ToneGenerator *self, int unused) {
 
 /////////////////////////////////////////////////////////////////////////////
 // Melody播放相关函数
-// 根据输入的tempo（BPM）计算beat_duration，再结合note_pattern计算每个音符的持续时间
+// 根据BPM计算拍长，再结合note_pattern计算每个音符的持续时间
 void start_playback(MusicPlayer *self, int unused) {
-    // 注意：在Conductor模式下，由键盘启动播放时才更新播放状态
+    // 仅在Conductor模式下，由键盘启动播放时更新播放状态
     self->current_note = 0;
     ASYNC(self, next_note, 0);
 }
@@ -253,11 +257,8 @@ void next_note(MusicPlayer *self, int unused) {
     int noteFreqIndex = self->melody[self->current_note] + self->key;
     int period_index = (noteFreqIndex < min_index || noteFreqIndex > max_index) ? -1 : noteFreqIndex - min_index;
     
-    // 根据当前BPM计算每拍时长（ms）
-    unsigned int beat_duration = 60000 / self->tempo;
-    // 取当前音符的时值因子（如1、2或0.5）
-    float note_factor = self->note_pattern[self->current_note];
-    // 计算当前音符的持续时间（ms）
+    unsigned int beat_duration = 60000 / self->tempo; // 拍长，单位ms
+    float note_factor = self->note_pattern[self->current_note]; // 当前音符时值因子
     unsigned int note_duration = (unsigned int)(beat_duration * note_factor);
     
     if (period_index != -1) {
@@ -292,8 +293,9 @@ void increase_load(BackgroundTask *self, int unused) {
         char msg[50];
         snprintf(msg, sizeof(msg), "Increased load: %d\n", self->background_loop_range);
         SCI_WRITE(&sci0, msg);
-    } else
+    } else {
         SCI_WRITE(&sci0, "Max load Already!\n");
+    }
 }
 
 void decrease_load(BackgroundTask *self, int unused) {
@@ -302,8 +304,9 @@ void decrease_load(BackgroundTask *self, int unused) {
         char msg[50];
         snprintf(msg, sizeof(msg), "Decreased load: %d\n", self->background_loop_range);
         SCI_WRITE(&sci0, msg);
-    } else
+    } else {
         SCI_WRITE(&sci0, "Min load Already!\n");
+    }
 }
 
 void toggle_deadline(BackgroundTask *self, int unused) {
@@ -320,16 +323,18 @@ void increase_volume(ToneGenerator *self, int unused) {
     if (self->volume < 20) {
         self->volume += 1;
         SCI_WRITE(&sci0, "Increased Volume\n");
-    } else
+    } else {
         SCI_WRITE(&sci0, "Max Volume Already!\n");
+    }
 }
 
 void decrease_volume(ToneGenerator *self, int unused) {
     if (self->volume > 1) {
         self->volume -= 1;
         SCI_WRITE(&sci0, "Decreased Volume\n");
-    } else
+    } else {
         SCI_WRITE(&sci0, "Min Volume Already!\n");
+    }
 }
 
 void toggle_mute(ToneGenerator *self, int unused) {
@@ -355,8 +360,8 @@ void send_CAN_command(char *cmd) {
     CAN_SEND(&can0, &msg);
 }
 
-// 在process_CAN_message中检测"disconnect"和"reconnect"消息以更新CAN状态，并在重新连接时刷新缓存
 void process_CAN_message(App *self, char *buffer) {
+    // 检查断线与重连消息
     if (strcmp(buffer, "disconnect") == 0) {
         canConnected = 0;
         SCI_WRITE(&sci0, "CAN disconnected.\n");
@@ -365,6 +370,7 @@ void process_CAN_message(App *self, char *buffer) {
     if (strcmp(buffer, "reconnect") == 0) {
         canConnected = 1;
         SCI_WRITE(&sci0, "CAN reconnected.\n");
+        // 当收到重连消息时，刷新并打印整个输入缓存
         flushInputCache();
         return;
     }
@@ -375,7 +381,7 @@ void process_CAN_message(App *self, char *buffer) {
         char msg[50];
         snprintf(msg, sizeof(msg), "CAN: key updated to %d\n", new_key);
         SCI_WRITE(&sci0, msg);
-        get_period_key(self, new_key);
+        //get_period_key(self, new_key);
     }
     else if (buffer[0] == 'T') {
         int new_tempo = atoi(buffer + 1);
@@ -394,8 +400,9 @@ void process_CAN_message(App *self, char *buffer) {
                 self->playback_active = 1;
                 SCI_WRITE(&sci0, "CAN: play command received\n");
                 ASYNC(&musicPlayer, start_playback, 0);
-            } else
+            } else {
                 SCI_WRITE(&sci0, "Already playing. Duplicate play command ignored.\n");
+            }
         }
     }
     else if (strcmp(buffer, "stop") == 0) {
@@ -408,14 +415,18 @@ void process_CAN_message(App *self, char *buffer) {
             SCI_WRITE(&sci0, "CAN: stop command received\n");
         }
     }
-    else if (strcmp(buffer, "mute") == 0)
+    else if (strcmp(buffer, "mute") == 0) {
         toneGen.muted = 1;
-    else if (strcmp(buffer, "unmute") == 0)
+    }
+    else if (strcmp(buffer, "unmute") == 0) {
         toneGen.muted = 0;
-    else if (strcmp(buffer, "volup") == 0)
+    }
+    else if (strcmp(buffer, "volup") == 0) {
         ASYNC(&toneGen, increase_volume, 0);
-    else if (strcmp(buffer, "voldown") == 0)
+    }
+    else if (strcmp(buffer, "voldown") == 0) {
         ASYNC(&toneGen, decrease_volume, 0);
+    }
 }
 
 void receiver(App *self, int unused) {
@@ -424,7 +435,8 @@ void receiver(App *self, int unused) {
     if (msg.length < sizeof(msg.buff))
         msg.buff[msg.length] = '\0';
     else
-        msg.buff[sizeof(msg.buff)-1] = '\0';
+        msg.buff[sizeof(msg.buff) - 1] = '\0';
+    // 无论在哪种模式下，都打印接收到的CAN消息
     SCI_WRITE(&sci0, "CAN msg received: ");
     SCI_WRITE(&sci0, msg.buff);
     SCI_WRITE(&sci0, "\n");
@@ -449,30 +461,47 @@ void reader(App *self, int c) {
     if (self->mode == CONDUCTOR_MODE) {
         switch (c) {
             case 'e': {
-                SCI_WRITE(&sci0, "Rcv: 'e'\n");
-                self->buffer[self->buf_index] = '\0';
-                int num = atoi(self->buffer);
-                self->buf_index = 0;
-                // 如果CAN已连接，则直接处理；否则，将输入缓存起来
-                if (isCANConnected()) {
-                    self->current_key = num;
-                    musicPlayer.key = num;
-                    get_period_key(self, num);
-                    char can_cmd[8];
-                    snprintf(can_cmd, sizeof(can_cmd), "K%d", num);
-                    send_CAN_command(can_cmd);
-                    flushInputCache();
-                } else {
-                    char temp[10];
-                    snprintf(temp, sizeof(temp), "%d ", num);
-                    int len = strlen(temp);
-                    if (cacheIndex + len < CACHE_SIZE) {
-                        strcpy(&inputCache[cacheIndex], temp);
-                        cacheIndex += len;
-                    }
-                }
-                break;
-            }
+    SCI_WRITE(&sci0, "Rcv: 'e'\n");
+    self->buffer[self->buf_index] = '\0';
+    int num = atoi(self->buffer);
+    self->buf_index = 0;
+    if (num >= -5 && num <= 5) {
+        if (isCANConnected()) {
+            // CAN连接正常时，直接处理更新
+            self->current_key = num;
+            musicPlayer.key = num;
+            //get_period_key(self, num);
+            char can_cmd[8];
+            snprintf(can_cmd, sizeof(can_cmd), "K%d", num);
+            send_CAN_command(can_cmd);
+            // 不调用 flushInputCache()，以便断线期间的缓存不会被清空
+        } else {
+            // CAN断开时，将输入追加到缓存中
+            char temp[10];
+            snprintf(temp, sizeof(temp), "%d ", num);
+            strncat(inputCache, temp, CACHE_SIZE - strlen(inputCache) - 1);
+        }
+    }
+    else if (num >= 60 && num <= 240) {
+        if (isCANConnected()) {
+            self->tempo = num;
+            musicPlayer.tempo = num;
+            char can_cmd[8];
+            snprintf(can_cmd, sizeof(can_cmd), "T%d", num);
+            send_CAN_command(can_cmd);
+            SCI_WRITE(&sci0, "Tempo updated\n");
+        } else {
+            char temp[10];
+            snprintf(temp, sizeof(temp), "%d ", num);
+            strncat(inputCache, temp, CACHE_SIZE - strlen(inputCache) - 1);
+        }
+    }
+    else {
+        SCI_WRITE(&sci0, "Invalid input.\n");
+    }
+    break;
+}
+
             case 'u':
                 ASYNC(&toneGen, increase_volume, 0);
                 SCI_WRITE(&sci0, "Volume Up\n");
@@ -556,9 +585,12 @@ void reader(App *self, int c) {
                 break;
             case 'm':
                 SCI_WRITE(&sci0, "Musician Mode: Mute toggled\n");
-                // 仅发送CAN命令，不更新本地状态
-                send_CAN_command("mute");
+                if (toneGen.muted)
+                    send_CAN_command("unmute");
+                else
+                    send_CAN_command("mute");
                 break;
+
             case 'p':
                 SCI_WRITE(&sci0, "Musician Mode: Play command\n");
                 send_CAN_command("play");
@@ -600,18 +632,17 @@ void startApp(App *self, int arg) {
     
     init_period(self);
     freq_index(self);
-   
+    
     self->current_key = 0;
     self->tempo = DEFAULT_TEMPO;
-    get_period_key(self, 0);
     
     init_dwt();
     
     ASYNC(&toneGen, generate_tone, 0);
-    // 如果需要，也可以启动后台任务
-    // ASYNC(&bgTask, load_task, 0);
+    // 如需要可启动后台任务： ASYNC(&bgTask, load_task, 0);
     
     // 启动时不自动启动旋律播放，需按 'p' 键启动
+    
     msg.msgId = 1;
     msg.nodeId = 1;
     msg.length = 6;
